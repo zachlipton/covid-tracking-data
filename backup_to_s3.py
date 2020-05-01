@@ -57,9 +57,15 @@ class S3Backup():
 
     # for now just uploads image (PNG) file with specified name
     def upload_file(self, local_path, s3_path):
+        if local_path.endswith('.png'):
+            extra_args = {'ContentType': 'image/png'}
+        elif local_path.endswith('.pdf'):
+            extra_args = {'ContentType': 'application/pdf'}
+        else:
+            raise ValueError('unknown file type for local path: %s' % local_path)
+    
         self.s3.meta.client.upload_file(
-            local_path, self.bucket_name, s3_path,
-            ExtraArgs={'ContentType': 'image/png'})
+            local_path, self.bucket_name, s3_path, ExtraArgs=extra_args)
 
     # delete most recent snapshot with filename containing <state>-<suffix> or <state> if no suffix
     def delete_most_recent_snapshot(self, state, suffix=''):
@@ -94,54 +100,61 @@ class Screenshotter():
         """
         logger.info(f"Retrieving {data_url}")
 
-        data = {
-            'url': data_url,
-            'renderType': 'png',
-        }
+        # if this is for the MA dashboard, it's just a PDF which we should download
+        if state == 'MA' and 'specialcase' in path:
+            logger.info('Grabbing MA special-case dashboard...')
+            response = requests.get(data_url)
+            logger.info('Done.')
 
-        # PhantomJScloud gets the page length wrong for some states, need to set those manually
-        if state in ['ID', 'PA', 'IN', 'CA']:
-            logger.info(f"using larger viewport for state {state}")
-            data['renderSettings'] = {'viewport': {'width': 1400, 'height': 3000}}
-        elif state in ['NE']:
-            # really huge viewport for some reason
-            logger.info(f"using huge viewport for state {state}")
-            data['renderSettings'] = {'viewport': {'width': 1400, 'height': 5000}}
-        elif state in ['UT']:
-            # Utah dashboard doesn't render in phantomjscloud unless I set clipRectangle
-            data['renderSettings'] = {'clipRectangle': {'width': 1400, 'height': 3000}}
+        # otherwise, go the PhantomJSCloud .png route
+        else:
+            data = {
+                'url': data_url,
+                'renderType': 'png',
+            }
 
-        logger.info('Posting request...')
-        response = requests.post(self.phantomjs_url, json.dumps(data))
-        logger.info('Done.')
+            # PhantomJScloud gets the page length wrong for some states, need to set those manually
+            if state in ['ID', 'PA', 'IN', 'CA']:
+                logger.info(f"using larger viewport for state {state}")
+                data['renderSettings'] = {'viewport': {'width': 1400, 'height': 3000}}
+            elif state in ['NE']:
+                # really huge viewport for some reason
+                logger.info(f"using huge viewport for state {state}")
+                data['renderSettings'] = {'viewport': {'width': 1400, 'height': 5000}}
+            elif state in ['UT']:
+                # Utah dashboard doesn't render in phantomjscloud unless I set clipRectangle
+                data['renderSettings'] = {'clipRectangle': {'width': 1400, 'height': 3000}}
+
+            logger.info('Posting request...')
+            response = requests.post(self.phantomjs_url, json.dumps(data))
+            logger.info('Done.')
 
         if response.status_code == 200:
             with open(path, 'wb') as f:
                 f.write(response.content)
         else:
-            logger.error(f'Response status code: {response.status_code}')
             logger.error(f'Failed to retrieve URL but will write content anyway: {data_url}')
             with open(path, 'wb') as f:
                 f.write(response.content)
-            raise
+            raise ValueError(f'Response status code: {response.status_code}')
 
     @staticmethod
-    def timestamped_filename(state, suffix=''):
+    def timestamped_filename(state, suffix='', file_ext='png'):
         state_with_modifier = state if len(suffix) == 0 else '%s-%s' % (state, suffix)
         timestamp = datetime.now(timezone('US/Eastern')).strftime("%Y%m%d-%H%M%S")
-        return "%s-%s.png" % (state_with_modifier, timestamp)
+        return "%s-%s.%s" % (state_with_modifier, timestamp, file_ext)
 
     @staticmethod
-    def get_s3_path(state, suffix=''):
-        filename = Screenshotter.timestamped_filename(state, suffix)
+    def get_s3_path(state, suffix='', file_ext='png'):
+        filename = Screenshotter.timestamped_filename(state, suffix, file_ext)
         return os.path.join('state_screenshots', state, filename)
 
-    def get_local_path(self, state, suffix=''):
+    def get_local_path(self, state, suffix='', file_ext='png'):
         # basename will be e.g. 'CA' if no suffix, or 'CA-secondary' if suffix is 'secondary'
-        filename = Screenshotter.timestamped_filename(state, suffix)
+        filename = Screenshotter.timestamped_filename(state, suffix, file_ext)
         return os.path.join(self.local_dir, filename)
 
-    def screenshot(self, state, data_url, suffix='',
+    def screenshot(self, state, data_url, suffix='', file_ext='png',
             backup_to_s3=False, replace_most_recent_snapshot=False):
         """Screenshots state data site.
 
@@ -156,6 +169,9 @@ class Screenshotter():
         suffix : str
             If present, will be used in the resulting local and S3 filename (STATE_suffix)
 
+        file_ext : str
+            If present, used as a file extension for the screenshot. Default: png
+
         backup_to_s3 : bool
             If true, will push to S3. If false, backup will be only local
 
@@ -166,16 +182,23 @@ class Screenshotter():
         """
 
         logger.info(f"Screenshotting {state} {suffix} from {data_url}")
-        local_path = self.get_local_path(state, suffix)
+        local_path = self.get_local_path(state, suffix, file_ext)
         self.save_url_image_to_path(state, data_url, local_path)
         if backup_to_s3:
-            s3_path = self.get_s3_path(state, suffix)
+            s3_path = self.get_s3_path(state, suffix, file_ext)
             if replace_most_recent_snapshot:
                 logger.info(f"    3a. first delete the most recent snapshot")
                 self.s3_backup.delete_most_recent_snapshot(state, suffix)
             logger.info(f"    4. push to s3 at {s3_path}")
             self.s3_backup.upload_file(local_path, s3_path)
 
+
+# Return a list of tuples: (state abbreviation, URL, file extension).
+def special_case_urls():
+    # for MA, we need to do something stupid like this
+    ma_url = 'https://www.mass.gov/doc/covid-19-dashboard-april-26-2020/download'
+    ma_data = ('MA', ma_url, 'pdf')
+    return [ma_data]
 
 def main(args_list=None):
     if args_list is None:
@@ -194,11 +217,11 @@ def main(args_list=None):
     failed_states = []
 
     # screenshot public state site
-    screenshotter.screenshot(
-        'public',
-        'https://covidtracking.com/data/',
-        backup_to_s3=args.push_to_s3,
-        replace_most_recent_snapshot=args.replace_most_recent_snapshot)
+    # screenshotter.screenshot(
+    #     'public',
+    #     'https://covidtracking.com/data/',
+    #     backup_to_s3=args.push_to_s3,
+    #     replace_most_recent_snapshot=args.replace_most_recent_snapshot)
 
     if args.public_only:
         logger.info("Not snapshotting state pages, was asked for --public-only")
@@ -227,10 +250,19 @@ def main(args_list=None):
         except:
             failed_states.append(state)
 
+    # go through special cases: states, URLs
+    special_states = special_case_urls()
+    for state_tuple in special_states:
+        state, data_url, file_ext = state_tuple
+        screenshotter.screenshot(
+            state, data_url, suffix='specialcase', file_ext=file_ext,
+            backup_to_s3=args.push_to_s3,
+            replace_most_recent_snapshot=args.replace_most_recent_snapshot)
+
     if failed_states:
         logger.error(f"Failed states for this run: {','.join(failed_states)}")
     else:
-        logger.error("All required states successfully screenshotted")
+        logger.info("All required states successfully screenshotted")
 
 
 if __name__ == "__main__":
